@@ -1,0 +1,71 @@
+{
+  "sessions": 6,
+  "prompts": 6,
+  "steps": 12,
+  "tokens": {
+    "input": 69965,
+    "output": 5365,
+    "reasoning": 4518,
+    "cache": {
+      "read": 21600,
+      "write": 0
+    }
+  },
+  "cost": 0.00367155,
+  "models": [
+    {
+      "model": {
+        "id": "nemotron-3-ultra-free",
+        "providerID": "opencode",
+        "variant": "default"
+      },
+      "steps": 7,
+      "tokens": {
+        "input": 65432,
+        "output": 3561,
+        "reasoning": 1336,
+        "cache": {
+          "read": 21600,
+          "write": 0
+        }
+      },
+      "cost": 0
+    },
+    {
+      "model": {
+        "id": "openai/gpt-oss-120b",
+        "providerID": "groq",
+        "variant": "default"
+      },
+      "steps": 4,
+      "tokens": {
+        "input": 4533,
+        "output": 1804,
+        "reasoning": 3182,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      },
+      "cost": 0.00367155
+    },
+    {
+      "model": {
+        "id": "deepseek-v4.1-flash-free",
+        "providerID": "opencode",
+        "variant": "default"
+      },
+      "steps": 1,
+      "tokens": {
+        "input": 0,
+        "output": 0,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      },
+      "cost": 0
+    }
+  ]
+}

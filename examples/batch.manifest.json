@@ -1,0 +1,12 @@
+{
+  "tasks": [
+    {
+      "taskName": "TASK-001",
+      "clonePath": "<WORKSPACE>/.agent-work/TASK-001",
+      "promptPath": "<WORKSPACE>/.agent-runtime/TASK-001.txt",
+      "model": "groq/openai/gpt-oss-120b",
+      "timeoutSeconds": 120,
+      "attachments": ["README.md"]
+    }
+  ]
+}

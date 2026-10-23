@@ -1,0 +1,162 @@
+param(
+  [Parameter(Mandatory=$true)][string]$MainPath,
+  [Parameter(Mandatory=$true)][string]$ManifestPath
+)
+
+$ErrorActionPreference = 'Stop'
+$workspace = (Resolve-Path -LiteralPath '<WORKSPACE_ROOT>').Path
+$agentRoot = (Resolve-Path -LiteralPath (Join-Path $workspace '.agent-work')).Path
+$main = (Resolve-Path -LiteralPath $MainPath).Path
+$manifestFile = (Resolve-Path -LiteralPath $ManifestPath).Path
+$logRoot = Join-Path $workspace '.agent-runtime'
+$opencode = '<OPENCODE_EXE>'
+
+if (-not $main.StartsWith($workspace + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+  throw 'MainPath must be inside workspace'
+}
+if (-not (Test-Path -LiteralPath (Join-Path $main '.git'))) { throw 'MainPath must be a Git repository' }
+
+$manifest = Get-Content -LiteralPath $manifestFile -Raw -Encoding utf8 | ConvertFrom-Json
+$jobs = @($manifest.tasks)
+if ($jobs.Count -lt 1 -or $jobs.Count -gt 6) { throw 'Batch must contain 1-6 tasks' }
+$seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$items = @()
+foreach ($job in $jobs) {
+  $name = [string]$job.taskName
+  if ($name -notmatch '^[A-Za-z0-9_-]+$' -or -not $seen.Add($name)) { throw 'Invalid or duplicate task name' }
+  $clone = (Resolve-Path -LiteralPath ([string]$job.clonePath)).Path
+  if (-not $clone.StartsWith($agentRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Clone outside .agent-work: $name"
+  }
+  if (-not (Test-Path -LiteralPath (Join-Path $clone '.git'))) { throw "Clone is not Git: $name" }
+  $prompt = (Resolve-Path -LiteralPath ([string]$job.promptPath)).Path
+  $model = [string]$job.model
+  if ([string]::IsNullOrWhiteSpace($model)) { throw "Missing model: $name" }
+  $timeout = [int]$job.timeoutSeconds
+  if ($timeout -lt 10 -or $timeout -gt 600) { throw "Timeout outside 10-600s: $name" }
+  $attachments = @()
+  foreach ($attachment in @($job.attachments)) {
+    $attachmentPath = [IO.Path]::GetFullPath((Join-Path $clone ([string]$attachment)))
+    if (-not $attachmentPath.StartsWith($clone + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+      throw "Attachment outside clone: $name"
+    }
+    if (-not (Test-Path -LiteralPath $attachmentPath)) { throw "Missing attachment: $name" }
+    $attachments += [string]$attachment
+  }
+  $items += [pscustomobject]@{ Name=$name; Clone=$clone; Prompt=$prompt; Model=$model; Timeout=$timeout; Attachments=$attachments }
+}
+
+$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$protectedPaths = [Collections.Generic.List[string]]::new()
+$states = [Collections.Generic.List[object]]::new()
+try {
+  $canonicalRepos = @(Get-ChildItem -LiteralPath $workspace -Directory | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName '.git') } | ForEach-Object { $_.FullName })
+  if ($main -notin $canonicalRepos) { throw 'MainPath is not an immediate canonical repository' }
+  foreach ($path in @($canonicalRepos) + @((Join-Path $workspace 'docs'))) {
+    icacls.exe $path /deny ('*' + $sid + ':(OI)(CI)(W,D)') | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Cannot protect: $path" }
+    $protectedPaths.Add($path)
+  }
+  $rootInstructions = Join-Path $workspace 'AGENTS.md'
+  if (Test-Path -LiteralPath $rootInstructions) {
+    icacls.exe $rootInstructions /deny ('*' + $sid + ':(W,D)') | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot protect root AGENTS.md' }
+    $protectedPaths.Add($rootInstructions)
+  }
+  foreach ($repo in $canonicalRepos) {
+    try {
+      New-Item -ItemType File -Path (Join-Path $repo '.agent-write-probe') -ErrorAction Stop | Out-Null
+      throw "Canonical repository remains writable: $repo"
+    } catch [System.UnauthorizedAccessException] { }
+  }
+
+  foreach ($item in $items) {
+    $psi = [Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $opencode
+    $psi.WorkingDirectory = $item.Clone
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.EnvironmentVariables['PYTHONPATH'] = 'src'
+    foreach ($arg in @('run','--standalone','--model',$item.Model,'--agent','build','--title',$item.Name)) {
+      [void]$psi.ArgumentList.Add($arg)
+    }
+    foreach ($attachment in $item.Attachments) {
+      [void]$psi.ArgumentList.Add('--file')
+      [void]$psi.ArgumentList.Add($attachment)
+    }
+    [void]$psi.ArgumentList.Add((Get-Content -LiteralPath $item.Prompt -Raw -Encoding utf8))
+
+    $outPath = Join-Path $logRoot ($item.Name + '.stdout.txt')
+    $errPath = Join-Path $logRoot ($item.Name + '.stderr.txt')
+    $utf8 = [Text.UTF8Encoding]::new($false)
+    $outWriter = [IO.StreamWriter]::new($outPath,$false,$utf8)
+    $errWriter = [IO.StreamWriter]::new($errPath,$false,$utf8)
+    $outWriter.AutoFlush = $true
+    $errWriter.AutoFlush = $true
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $psi
+    $didStart = $false
+    try {
+      [void]$process.Start()
+      $didStart = $true
+      $states.Add([pscustomobject]@{
+        Item=$item; Process=$process; Clock=[Diagnostics.Stopwatch]::StartNew();
+        OutWriter=$outWriter; ErrWriter=$errWriter;
+        OutRead=$process.StandardOutput.ReadLineAsync(); ErrRead=$process.StandardError.ReadLineAsync();
+        TimedOut=$false; Complete=$false; OutPath=$outPath; ErrPath=$errPath
+      })
+    } catch {
+      if ($didStart -and -not $process.HasExited) { $process.Kill($true); $process.WaitForExit() }
+      $process.Dispose()
+      $outWriter.Dispose()
+      $errWriter.Dispose()
+      throw
+    }
+    Write-Output ("Started $($item.Name): $($item.Model)")
+  }
+
+  while (@($states | Where-Object { -not $_.Complete }).Count -gt 0) {
+    foreach ($state in $states) {
+      if ($state.Complete) { continue }
+      if ($null -ne $state.OutRead -and $state.OutRead.IsCompleted) {
+        $line = $state.OutRead.GetAwaiter().GetResult()
+        if ($null -eq $line) { $state.OutRead = $null }
+        else { $state.OutWriter.WriteLine($line); $state.OutRead = $state.Process.StandardOutput.ReadLineAsync() }
+      }
+      if ($null -ne $state.ErrRead -and $state.ErrRead.IsCompleted) {
+        $line = $state.ErrRead.GetAwaiter().GetResult()
+        if ($null -eq $line) { $state.ErrRead = $null }
+        else { $state.ErrWriter.WriteLine($line); $state.ErrRead = $state.Process.StandardError.ReadLineAsync() }
+      }
+      if (-not $state.Process.HasExited -and $state.Clock.Elapsed.TotalSeconds -ge $state.Item.Timeout) {
+        $state.TimedOut = $true
+        $state.Process.Kill($true)
+      }
+      if ($state.Process.HasExited -and $null -eq $state.OutRead -and $null -eq $state.ErrRead) {
+        $state.Complete = $true
+        $state.Clock.Stop()
+        $seconds = [Math]::Round($state.Clock.Elapsed.TotalSeconds, 1)
+        Write-Output ("Finished $($state.Item.Name): exit=$($state.Process.ExitCode), timeout=$($state.TimedOut), seconds=$seconds")
+      }
+    }
+    Start-Sleep -Milliseconds 50
+  }
+} finally {
+  foreach ($state in $states) {
+    if (-not $state.Process.HasExited) { $state.Process.Kill($true) }
+    $state.Process.WaitForExit()
+    $state.OutWriter.Dispose()
+    $state.ErrWriter.Dispose()
+    $state.Process.Dispose()
+  }
+  foreach ($path in $protectedPaths) { icacls.exe $path /remove:d ('*' + $sid) | Out-Null }
+  foreach ($repo in $canonicalRepos) {
+    Remove-Item -LiteralPath (Join-Path $repo '.agent-write-probe') -ErrorAction SilentlyContinue
+    $probe = Join-Path $repo '.coordinator-write-probe'
+    New-Item -ItemType File -Path $probe -ErrorAction Stop | Out-Null
+    Remove-Item -LiteralPath $probe -ErrorAction Stop
+  }
+  Write-Output 'Canonical repository writes restored: True'
+}

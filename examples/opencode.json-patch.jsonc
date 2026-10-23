@@ -1,0 +1,21 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "warming": false,
+  "tool_output": {
+    "max_lines": 1200,
+    "max_bytes": 60000
+  },
+  "permissions": [
+    {
+      "action": "*",
+      "resource": "*",
+      "effect": "deny"
+    }
+  ],
+  "agents": {
+    "build": {
+      "steps": 2,
+      "system": "You return only the exact JSON patch requested. Use no tools. The coordinator applies validated replacement text to an isolated candidate and runs tests. Do not explain, plan, read files or wrap the JSON in markdown."
+    }
+  }
+}
